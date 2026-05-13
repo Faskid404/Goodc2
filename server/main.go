@@ -23,6 +23,8 @@ func main() {
 	initDB(dbPath())
 	log.Println("[db] ready")
 
+	startAlerter()
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", HandleHealth)
