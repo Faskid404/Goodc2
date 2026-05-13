@@ -1,105 +1,105 @@
 package main
 
 import (
-	"database/sql"
-	"encoding/json"
+	"context"
 	"log"
 	"net/http"
-	"sync"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
-
-	"github.com/gorilla/websocket"
-	_ "github.com/mattn/go-sqlite3"
 )
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+func dbPath() string {
+	if p := os.Getenv("DB_PATH"); p != "" {
+		return p
+	}
+	return "c2.db"
 }
-
-type Implant struct {
-	ID        string
-	Hostname  string
-	IP        string
-	OS        string
-	LastSeen  time.Time
-	Conn      *websocket.Conn
-}
-
-type Command struct {
-	ID      string `json:"id"`
-	Type    string `json:"type"`
-	Payload string `json:"payload"`
-}
-
-var (
-	implantMap = make(map[string]*Implant)
-	mu         sync.Mutex
-	db         *sql.DB
-)
 
 func main() {
-	var err error
-	db, err = sql.Open("sqlite3", "c2.db")
-	if err != nil {
-		log.Fatal(err)
+	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+
+	initDB(dbPath())
+	log.Println("[db] ready")
+
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("GET /healthz", HandleHealth)
+	mux.HandleFunc("POST /api/auth/login", HandleLogin)
+
+	mux.Handle("GET /ws/agent", middlewareAgentToken(http.HandlerFunc(HandleAgentWS)))
+	mux.Handle("GET /ws/dashboard", middlewareJWT(http.HandlerFunc(HandleDashboardWS)))
+
+	api := http.NewServeMux()
+	api.HandleFunc("GET /agents", HandleListAgents)
+	api.HandleFunc("GET /agents/{id}/metrics", HandleAgentMetrics)
+	api.HandleFunc("GET /agents/{id}/events", HandleAgentEvents)
+	api.HandleFunc("GET /agents/{id}/commands", HandleAgentCommands)
+	api.HandleFunc("POST /agents/{id}/commands", HandleAgentCommands)
+	api.HandleFunc("GET /events", HandleAllEvents)
+	mux.Handle("/api/", middlewareJWT(http.StripPrefix("/api", api)))
+
+	mux.Handle("/", http.FileServer(http.Dir("dashboard/dist")))
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
 	}
-	defer db.Close()
 
-	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS implants (id TEXT PRIMARY KEY, hostname TEXT, ip TEXT, os TEXT, last_seen TEXT)`)
+	srv := &http.Server{
+		Addr:         ":" + port,
+		Handler:      withCORS(withLogger(mux)),
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 60 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
 
-	http.HandleFunc("/ws", handleWS)
-	http.Handle("/", http.FileServer(http.Dir("dashboard/dist")))
+	go func() {
+		log.Printf("[server] :%s", port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("[server] fatal: %v", err)
+		}
+	}()
 
-	log.Println("C2 Server running on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	log.Println("[server] shutting down")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	srv.Shutdown(ctx)
+	log.Println("[server] stopped")
 }
 
-func handleWS(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-
-	var initData map[string]string
-	conn.ReadJSON(&initData)
-
-	id := initData["id"]
-	if id == "" {
-		id = "implant-" + time.Now().Format("20060102150405")
-	}
-
-	mu.Lock()
-	implant := &Implant{ID: id, Hostname: initData["hostname"], IP: initData["ip"], OS: initData["os"], LastSeen: time.Now(), Conn: conn}
-	implantMap[id] = implant
-	mu.Unlock()
-
-	log.Printf("Implant connected: %s", id)
-
-	for {
-		var msg map[string]interface{}
-		err := conn.ReadJSON(&msg)
-		if err != nil {
-			mu.Lock()
-			delete(implantMap, id)
-			mu.Unlock()
-			break
+func withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if o := r.Header.Get("Origin"); o != "" {
+			w.Header().Set("Access-Control-Allow-Origin", o)
+			w.Header().Set("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization,Content-Type,X-Agent-Token")
+			w.Header().Set("Access-Control-Max-Age", "86400")
 		}
-
-		if cmdType, ok := msg["type"].(string); ok && cmdType == "result" {
-			log.Printf("Result from %s: %v", id, msg["data"])
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
 		}
-	}
+		next.ServeHTTP(w, r)
+	})
 }
 
-func SendCommand(implantID, cmdType, payload string) {
-	mu.Lock()
-	implant, exists := implantMap[implantID]
-	mu.Unlock()
-	if !exists {
-		return
-	}
+type rw struct {
+	http.ResponseWriter
+	code int
+}
 
-	cmd := Command{ID: "cmd-" + time.Now().Format("20060102150405"), Type: cmdType, Payload: payload}
-	implant.Conn.WriteJSON(cmd)
+func (r *rw) WriteHeader(c int) { r.code = c; r.ResponseWriter.WriteHeader(c) }
+
+func withLogger(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t := time.Now()
+		wrapped := &rw{ResponseWriter: w, code: 200}
+		next.ServeHTTP(wrapped, r)
+		log.Printf("[http] %d %s %s %s", wrapped.code, r.Method, r.URL.Path, time.Since(t))
+	})
 }

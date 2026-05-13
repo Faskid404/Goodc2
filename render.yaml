@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: goodc2
+    runtime: go
+    plan: free
+    buildCommand: go mod download && CGO_ENABLED=1 go build -ldflags="-s -w" -o c2server ./server
+    startCommand: ./c2server
+    envVars:
+      - key: PORT
+        generateValue: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: AGENT_TOKEN
+        generateValue: true
+      - key: DASH_PASSWORD
+        value: omowoli12345
+      - key: DB_PATH
+        value: /var/data/c2.db
+    disk:
+      name: c2-data
+      mountPath: /var/data
+      sizeGB: 1
+    healthCheckPath: /healthz
