@@ -3,7 +3,7 @@ services:
     name: goodc2
     runtime: go
     plan: free
-    buildCommand: go mod download && CGO_ENABLED=1 go build -ldflags="-s -w" -o c2server ./server
+    buildCommand: go mod tidy && CGO_ENABLED=1 go build -ldflags="-s -w" -o c2server ./server
     startCommand: ./c2server
     envVars:
       - key: PORT
